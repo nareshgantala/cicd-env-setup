@@ -13,7 +13,24 @@ SONAR_HTTP=9000
 
 # Named volumes (data persists across re-creates)
 JENKINS_VOL="jenkins_home"
+JENKINS_CACHE_VOL="jenkins_cache"
 SONAR_VOL_DATA="sonarqube_data"
+SONAR_VOL_EXTENSIONS="sonarqube_extensions"
+SONAR_VOL_LOGS="sonarqube_logs"
+
+# Resource limits (adjust based on instance type)
+# For t3.xlarge (16GB): Jenkins 6GB, SonarQube 4GB
+# For t3.large (8GB): Jenkins 4GB, SonarQube 2GB
+JENKINS_MEMORY="${JENKINS_MEMORY:-6g}"
+JENKINS_MEMORY_SWAP="${JENKINS_MEMORY_SWAP:-6g}"
+JENKINS_CPUS="${JENKINS_CPUS:-2}"
+JENKINS_JAVA_OPTS="${JENKINS_JAVA_OPTS:--Xms1g -Xmx4g -XX:MaxMetaspaceSize=512m}"
+
+SONAR_MEMORY="${SONAR_MEMORY:-4g}"
+SONAR_MEMORY_SWAP="${SONAR_MEMORY_SWAP:-4g}"
+SONAR_CPUS="${SONAR_CPUS:-2}"
+SONAR_ES_JAVA_OPTS="${SONAR_ES_JAVA_OPTS:--Xms1g -Xmx2g}"
+SONAR_JAVA_OPTS="${SONAR_JAVA_OPTS:--Xms512m -Xmx1g -XX:MaxMetaspaceSize=512m}"
 
 # Behavior flags (env override): RECREATE=1 to force re-create, PULL=1 to docker pull images
 RECREATE="${RECREATE:-0}"
@@ -23,6 +40,44 @@ PULL="${PULL:-0}"
 log(){ printf "\n%s\n" "$*"; }
 exists_container(){ docker ps -a --format '{{.Names}}' | grep -qx "$1"; }
 is_running(){ docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null | grep -qx 'true'; }
+
+detect_instance_resources(){
+  # Auto-detect available memory and adjust limits
+  local total_mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+  local total_mem_gb=$((total_mem_kb / 1024 / 1024))
+  
+  log "📊 Detected ${total_mem_gb}GB total memory"
+  
+  # Adjust resource limits based on available memory
+  if [ "$total_mem_gb" -ge 30 ]; then
+    log "🚀 High memory instance detected - using max resources"
+    JENKINS_MEMORY="8g"
+    JENKINS_MEMORY_SWAP="8g"
+    JENKINS_JAVA_OPTS="-Xms2g -Xmx6g -XX:MaxMetaspaceSize=512m"
+    SONAR_MEMORY="6g"
+    SONAR_MEMORY_SWAP="6g"
+    SONAR_ES_JAVA_OPTS="-Xms2g -Xmx4g"
+    SONAR_JAVA_OPTS="-Xms1g -Xmx2g -XX:MaxMetaspaceSize=512m"
+  elif [ "$total_mem_gb" -ge 15 ]; then
+    log "⚡ Medium memory instance detected - using recommended resources"
+    JENKINS_MEMORY="6g"
+    JENKINS_MEMORY_SWAP="6g"
+    JENKINS_JAVA_OPTS="-Xms1g -Xmx4g -XX:MaxMetaspaceSize=512m"
+    SONAR_MEMORY="4g"
+    SONAR_MEMORY_SWAP="4g"
+    SONAR_ES_JAVA_OPTS="-Xms1g -Xmx2g"
+    SONAR_JAVA_OPTS="-Xms512m -Xmx1g -XX:MaxMetaspaceSize=512m"
+  else
+    log "⚠️  Low memory instance detected - using minimal resources"
+    JENKINS_MEMORY="4g"
+    JENKINS_MEMORY_SWAP="4g"
+    JENKINS_JAVA_OPTS="-Xms512m -Xmx2g -XX:MaxMetaspaceSize=256m"
+    SONAR_MEMORY="2g"
+    SONAR_MEMORY_SWAP="2g"
+    SONAR_ES_JAVA_OPTS="-Xms512m -Xmx1g"
+    SONAR_JAVA_OPTS="-Xms256m -Xmx512m -XX:MaxMetaspaceSize=256m"
+  fi
+}
 
 ensure_network(){
   if ! docker network inspect "$NET_NAME" >/dev/null 2>&1; then
@@ -64,20 +119,52 @@ start_or_recreate(){
   fi
 }
 
-wait_for_jenkins_password(){
-  # Wait until Jenkins writes initialAdminPassword (fresh bootstrap) or confirm container is healthy/running.
-  local tries=60
-  local delay=2
-  while (( tries-- > 0 )); do
-    if docker exec "$JENKINS_NAME" bash -lc 'test -f /var/jenkins_home/secrets/initialAdminPassword' 2>/dev/null; then
+wait_for_service(){
+  local service_name="$1"
+  local port="$2"
+  local max_wait="${3:-300}"  # 5 minutes default
+  
+  log "⏳ Waiting for $service_name to be ready (max ${max_wait}s)..."
+  local elapsed=0
+  local interval=5
+  
+  while [ $elapsed -lt $max_wait ]; do
+    if curl -sf http://localhost:${port} >/dev/null 2>&1; then
+      log "✅ $service_name is ready!"
       return 0
     fi
-    # If Jenkins was already configured, the file may not exist anymore. Bail if the UI is responding.
+    sleep $interval
+    elapsed=$((elapsed + interval))
+    if [ $((elapsed % 30)) -eq 0 ]; then
+      log "   Still waiting... (${elapsed}s elapsed)"
+    fi
+  done
+  
+  log "⚠️  $service_name did not respond within ${max_wait}s"
+  return 1
+}
+
+wait_for_jenkins_password(){
+  # Wait until Jenkins writes initialAdminPassword or is ready
+  local tries=60
+  local delay=2
+  
+  log "⏳ Waiting for Jenkins initialization..."
+  
+  while (( tries-- > 0 )); do
+    if docker exec "$JENKINS_NAME" bash -lc 'test -f /var/jenkins_home/secrets/initialAdminPassword' 2>/dev/null; then
+      log "✅ Jenkins initialization complete!"
+      return 0
+    fi
+    # If Jenkins was already configured, the file may not exist
     if docker exec "$JENKINS_NAME" bash -lc "curl -fsS localhost:${JENKINS_HTTP:-8080} >/dev/null 2>&1 || true"; then
+      log "✅ Jenkins is ready (already configured)!"
       return 0
     fi
     sleep "$delay"
   done
+  
+  log "⚠️  Could not verify Jenkins initialization"
   return 0
 }
 
@@ -90,74 +177,158 @@ install_jenkins_tools_if_needed(){
     for pkg in curl ca-certificates unzip docker.io gnupg; do
       dpkg -s "$pkg" >/dev/null 2>&1 || need_apt=1
     done
+    
     if [ "$need_apt" -eq 1 ]; then
-      apt-get update
-      apt-get install -y curl ca-certificates unzip docker.io gnupg
+      echo "📦 Installing required packages..."
+      apt-get update -qq
+      apt-get install -y -qq curl ca-certificates unzip docker.io gnupg
     fi
 
     # AWS CLI (idempotent)
     if ! command -v aws >/dev/null 2>&1; then
+      echo "☁️  Installing AWS CLI..."
       curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o awscliv2.zip
       unzip -q awscliv2.zip
       ./aws/install
       rm -rf aws awscliv2.zip
     fi
 
-    # Trivy (distro-agnostic installer -> /usr/local/bin/trivy)
+    # Trivy (distro-agnostic installer)
     if ! command -v trivy >/dev/null 2>&1; then
+      echo "🔒 Installing Trivy..."
       curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
     fi
 
-    echo "✔ Tools ready (docker, unzip, aws, trivy)."
+    echo "✔ Tools ready: docker, aws-cli ($(aws --version | cut -d/ -f2 | cut -d" " -f1)), trivy ($(trivy --version | head -n1 | awk "{print \$2}"))"
   '
+}
+
+print_resource_info(){
+  log ""
+  log "📊 Container Resource Allocation:"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "Jenkins:"
+  echo "  Memory: ${JENKINS_MEMORY} (swap: ${JENKINS_MEMORY_SWAP})"
+  echo "  CPUs: ${JENKINS_CPUS}"
+  echo "  JVM: ${JENKINS_JAVA_OPTS}"
+  echo ""
+  echo "SonarQube:"
+  echo "  Memory: ${SONAR_MEMORY} (swap: ${SONAR_MEMORY_SWAP})"
+  echo "  CPUs: ${SONAR_CPUS}"
+  echo "  Elasticsearch JVM: ${SONAR_ES_JAVA_OPTS}"
+  echo "  SonarQube JVM: ${SONAR_JAVA_OPTS}"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
 print_endpoints(){
   log ""
   log "✅ Setup complete!"
   echo ""
-  echo "Jenkins URL:  http://localhost:${JENKINS_HTTP}"
-  echo -n "Jenkins Password (initial, if present): "
-  docker exec "$JENKINS_NAME" bash -lc 'cat /var/jenkins_home/secrets/initialAdminPassword 2>/dev/null || echo "(already configured / not present)"' || true
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "📍 ACCESS INFORMATION"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo ""
-  echo "SonarQube URL: http://localhost:${SONAR_HTTP}"
-  echo "SonarQube Login (default): admin / admin   (change on first login)"
+  echo "🔹 Jenkins"
+  echo "   URL: http://localhost:${JENKINS_HTTP}"
+  if docker exec "$JENKINS_NAME" bash -lc 'test -f /var/jenkins_home/secrets/initialAdminPassword' 2>/dev/null; then
+    echo -n "   Initial Password: "
+    docker exec "$JENKINS_NAME" cat /var/jenkins_home/secrets/initialAdminPassword 2>/dev/null || echo "(not found)"
+  else
+    echo "   Status: Already configured (no initial password)"
+  fi
   echo ""
-  echo "Next steps:"
-  echo "1) Open Jenkins and finish setup (or log in if already configured)."
-  echo "2) Open SonarQube and change the default password."
-  echo "3) (Optional) cd terraform && terraform init && terraform apply"
+  echo "🔹 SonarQube"
+  echo "   URL: http://localhost:${SONAR_HTTP}"
+  echo "   Default Login: admin / admin"
+  echo "   ⚠️  Change password on first login!"
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "📝 NEXT STEPS"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "1. Open Jenkins and complete setup wizard"
+  echo "2. Open SonarQube and change default password"
+  echo "3. Configure credentials in Jenkins"
+  echo "4. (Optional) Deploy infrastructure: cd terraform && terraform apply"
+  echo ""
+  echo "💡 Useful Commands:"
+  echo "   View logs:       docker logs jenkins -f"
+  echo "                    docker logs sonarqube -f"
+  echo "   Restart:         docker restart jenkins sonarqube"
+  echo "   Stop:            docker stop jenkins sonarqube"
+  echo "   Check status:    docker ps"
+  echo "   Check resources: docker stats jenkins sonarqube"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
 # ========= Main =========
 log "🛠️  Setting up E-Commerce DevOps Environment..."
+log "$(date)"
+
+# Detect and set optimal resource limits
+detect_instance_resources
+print_resource_info
 
 ensure_network
 pull_images_if_requested
 
-# Build run commands (redirect stdout to keep logs clean)
+# Build run commands with optimized settings
 JENKINS_RUN_CMD=$(cat <<CMD
-docker run -d --name "$JENKINS_NAME" --network "$NET_NAME" \
-  -p ${JENKINS_HTTP}:8080 -p ${JENKINS_AGENT}:50000 \
+docker run -d \
+  --name "$JENKINS_NAME" \
+  --network "$NET_NAME" \
+  --restart unless-stopped \
+  -p ${JENKINS_HTTP}:8080 \
+  -p ${JENKINS_AGENT}:50000 \
+  -e JAVA_OPTS="$JENKINS_JAVA_OPTS" \
+  -e JENKINS_OPTS="--sessionTimeout=1440" \
   -v ${JENKINS_VOL}:/var/jenkins_home \
+  -v ${JENKINS_CACHE_VOL}:/root/.cache \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  --user root jenkins/jenkins:lts >/dev/null
+  --user root \
+  --memory=${JENKINS_MEMORY} \
+  --memory-swap=${JENKINS_MEMORY_SWAP} \
+  --cpus=${JENKINS_CPUS} \
+  jenkins/jenkins:lts >/dev/null
 CMD
 )
 
 SONAR_RUN_CMD=$(cat <<CMD
-docker run -d --name "$SONAR_NAME" --network "$NET_NAME" \
+docker run -d \
+  --name "$SONAR_NAME" \
+  --network "$NET_NAME" \
+  --restart unless-stopped \
   -p ${SONAR_HTTP}:9000 \
+  -e SONAR_ES_BOOTSTRAP_CHECKS_DISABLE=true \
+  -e "SONAR_JDBC_URL=jdbc:h2:mem:sonar" \
+  -e "SONAR_JDBC_USERNAME=sonar" \
+  -e "SONAR_JDBC_PASSWORD=sonar" \
+  -e "ES_JAVA_OPTS=$SONAR_ES_JAVA_OPTS" \
+  -e "SONAR_JAVA_OPTS=$SONAR_JAVA_OPTS" \
+  -e "SONAR_WEB_JAVAADDITIONALOPTS=-server" \
+  -e "SONAR_CE_JAVAADDITIONALOPTS=-server" \
   -v ${SONAR_VOL_DATA}:/opt/sonarqube/data \
+  -v ${SONAR_VOL_EXTENSIONS}:/opt/sonarqube/extensions \
+  -v ${SONAR_VOL_LOGS}:/opt/sonarqube/logs \
+  --memory=${SONAR_MEMORY} \
+  --memory-swap=${SONAR_MEMORY_SWAP} \
+  --cpus=${SONAR_CPUS} \
   sonarqube:lts-community >/dev/null
 CMD
 )
 
+# Start containers
 start_or_recreate "$JENKINS_NAME" "$JENKINS_RUN_CMD"
 start_or_recreate "$SONAR_NAME" "$SONAR_RUN_CMD"
 
-# If Jenkins just launched, give it a moment and install tools
+# Wait for services to be ready
+wait_for_service "Jenkins" "$JENKINS_HTTP" 180
 wait_for_jenkins_password
 install_jenkins_tools_if_needed
 
+wait_for_service "SonarQube" "$SONAR_HTTP" 240
+
 print_endpoints
+
+log ""
+log "🎉 DevOps environment is ready!"
+log "$(date)"
