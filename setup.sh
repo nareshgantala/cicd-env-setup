@@ -1,7 +1,5 @@
 #!/bin/bash
-set -e
 
-echo "🚀 Setting up E-Commerce DevOps Environment..."
 
 for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do sudo apt-get remove $pkg; done
 
@@ -24,6 +22,10 @@ echo "Install latest docker version"
 
 sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
+
+set -e
+
+echo "🚀 Setting up E-Commerce DevOps Environment..."
 
 # 1. Create network
 docker network create devops-network 2>/dev/null || true
