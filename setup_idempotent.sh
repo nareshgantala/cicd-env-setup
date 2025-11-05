@@ -4,12 +4,14 @@ set -Eeuo pipefail
 # ========= Config =========
 JENKINS_NAME="jenkins"
 SONAR_NAME="sonarqube"
+POSTGRES_NAME="sonarqube-db"
 NET_NAME="devops-network"
 
 # Ports
 JENKINS_HTTP=8080
 JENKINS_AGENT=50000
 SONAR_HTTP=9000
+POSTGRES_PORT=5432
 
 # Named volumes (data persists across re-creates)
 JENKINS_VOL="jenkins_home"
@@ -17,10 +19,16 @@ JENKINS_CACHE_VOL="jenkins_cache"
 SONAR_VOL_DATA="sonarqube_data"
 SONAR_VOL_EXTENSIONS="sonarqube_extensions"
 SONAR_VOL_LOGS="sonarqube_logs"
+POSTGRES_VOL="postgresql_data"
+
+# Database credentials
+POSTGRES_USER="sonar"
+POSTGRES_PASSWORD="sonar"
+POSTGRES_DB="sonarqube"
 
 # Resource limits (adjust based on instance type)
-# For t3.xlarge (16GB): Jenkins 6GB, SonarQube 4GB
-# For t3.large (8GB): Jenkins 4GB, SonarQube 2GB
+# For t3.xlarge (16GB): Jenkins 6GB, SonarQube 4GB, PostgreSQL 1GB
+# For t3.large (8GB): Jenkins 4GB, SonarQube 2GB, PostgreSQL 512MB
 JENKINS_MEMORY="${JENKINS_MEMORY:-6g}"
 JENKINS_MEMORY_SWAP="${JENKINS_MEMORY_SWAP:-6g}"
 JENKINS_CPUS="${JENKINS_CPUS:-2}"
@@ -31,6 +39,10 @@ SONAR_MEMORY_SWAP="${SONAR_MEMORY_SWAP:-4g}"
 SONAR_CPUS="${SONAR_CPUS:-2}"
 SONAR_ES_JAVA_OPTS="${SONAR_ES_JAVA_OPTS:--Xms1g -Xmx2g}"
 SONAR_JAVA_OPTS="${SONAR_JAVA_OPTS:--Xms512m -Xmx1g -XX:MaxMetaspaceSize=512m}"
+
+POSTGRES_MEMORY="${POSTGRES_MEMORY:-1g}"
+POSTGRES_MEMORY_SWAP="${POSTGRES_MEMORY_SWAP:-1g}"
+POSTGRES_CPUS="${POSTGRES_CPUS:-1}"
 
 # Behavior flags (env override): RECREATE=1 to force re-create, PULL=1 to docker pull images
 RECREATE="${RECREATE:-0}"
@@ -58,6 +70,8 @@ detect_instance_resources(){
     SONAR_MEMORY_SWAP="6g"
     SONAR_ES_JAVA_OPTS="-Xms2g -Xmx4g"
     SONAR_JAVA_OPTS="-Xms1g -Xmx2g -XX:MaxMetaspaceSize=512m"
+    POSTGRES_MEMORY="2g"
+    POSTGRES_MEMORY_SWAP="2g"
   elif [ "$total_mem_gb" -ge 15 ]; then
     log "⚡ Medium memory instance detected - using recommended resources"
     JENKINS_MEMORY="6g"
@@ -67,15 +81,19 @@ detect_instance_resources(){
     SONAR_MEMORY_SWAP="4g"
     SONAR_ES_JAVA_OPTS="-Xms1g -Xmx2g"
     SONAR_JAVA_OPTS="-Xms512m -Xmx1g -XX:MaxMetaspaceSize=512m"
+    POSTGRES_MEMORY="1g"
+    POSTGRES_MEMORY_SWAP="1g"
   else
     log "⚠️  Low memory instance detected - using minimal resources"
-    JENKINS_MEMORY="4g"
-    JENKINS_MEMORY_SWAP="4g"
+    JENKINS_MEMORY="3g"
+    JENKINS_MEMORY_SWAP="3g"
     JENKINS_JAVA_OPTS="-Xms512m -Xmx2g -XX:MaxMetaspaceSize=256m"
     SONAR_MEMORY="2g"
     SONAR_MEMORY_SWAP="2g"
     SONAR_ES_JAVA_OPTS="-Xms512m -Xmx1g"
     SONAR_JAVA_OPTS="-Xms256m -Xmx512m -XX:MaxMetaspaceSize=256m"
+    POSTGRES_MEMORY="512m"
+    POSTGRES_MEMORY_SWAP="512m"
   fi
 }
 
@@ -93,6 +111,7 @@ pull_images_if_requested(){
     log "⬇️  Pulling latest images..."
     docker pull jenkins/jenkins:lts >/dev/null
     docker pull sonarqube:lts-community >/dev/null
+    docker pull postgres:15-alpine >/dev/null
   fi
 }
 
@@ -141,6 +160,26 @@ wait_for_service(){
   done
   
   log "⚠️  $service_name did not respond within ${max_wait}s"
+  return 1
+}
+
+wait_for_postgres(){
+  local max_wait="${1:-60}"
+  
+  log "⏳ Waiting for PostgreSQL to be ready (max ${max_wait}s)..."
+  local elapsed=0
+  local interval=2
+  
+  while [ $elapsed -lt $max_wait ]; do
+    if docker exec "$POSTGRES_NAME" pg_isready -U "$POSTGRES_USER" >/dev/null 2>&1; then
+      log "✅ PostgreSQL is ready!"
+      return 0
+    fi
+    sleep $interval
+    elapsed=$((elapsed + interval))
+  done
+  
+  log "⚠️  PostgreSQL did not respond within ${max_wait}s"
   return 1
 }
 
@@ -217,6 +256,10 @@ print_resource_info(){
   echo "  CPUs: ${SONAR_CPUS}"
   echo "  Elasticsearch JVM: ${SONAR_ES_JAVA_OPTS}"
   echo "  SonarQube JVM: ${SONAR_JAVA_OPTS}"
+  echo ""
+  echo "PostgreSQL:"
+  echo "  Memory: ${POSTGRES_MEMORY} (swap: ${POSTGRES_MEMORY_SWAP})"
+  echo "  CPUs: ${POSTGRES_CPUS}"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
@@ -242,6 +285,11 @@ print_endpoints(){
   echo "   Default Login: admin / admin"
   echo "   ⚠️  Change password on first login!"
   echo ""
+  echo "🔹 PostgreSQL (Internal)"
+  echo "   Container: ${POSTGRES_NAME}"
+  echo "   Database: ${POSTGRES_DB}"
+  echo "   User: ${POSTGRES_USER}"
+  echo ""
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo "📝 NEXT STEPS"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -253,10 +301,12 @@ print_endpoints(){
   echo "💡 Useful Commands:"
   echo "   View logs:       docker logs jenkins -f"
   echo "                    docker logs sonarqube -f"
-  echo "   Restart:         docker restart jenkins sonarqube"
-  echo "   Stop:            docker stop jenkins sonarqube"
+  echo "                    docker logs sonarqube-db -f"
+  echo "   Restart:         docker restart jenkins sonarqube sonarqube-db"
+  echo "   Stop:            docker stop jenkins sonarqube sonarqube-db"
   echo "   Check status:    docker ps"
-  echo "   Check resources: docker stats jenkins sonarqube"
+  echo "   Check resources: docker stats jenkins sonarqube sonarqube-db"
+  echo "   Database backup: docker exec sonarqube-db pg_dump -U sonar sonarqube > backup.sql"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
@@ -272,6 +322,22 @@ ensure_network
 pull_images_if_requested
 
 # Build run commands with optimized settings
+POSTGRES_RUN_CMD=$(cat <<CMD
+docker run -d \
+  --name "$POSTGRES_NAME" \
+  --network "$NET_NAME" \
+  --restart unless-stopped \
+  -e POSTGRES_USER="$POSTGRES_USER" \
+  -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+  -e POSTGRES_DB="$POSTGRES_DB" \
+  -v ${POSTGRES_VOL}:/var/lib/postgresql/data \
+  --memory=${POSTGRES_MEMORY} \
+  --memory-swap=${POSTGRES_MEMORY_SWAP} \
+  --cpus=${POSTGRES_CPUS} \
+  postgres:15-alpine >/dev/null
+CMD
+)
+
 JENKINS_RUN_CMD=$(cat <<CMD
 docker run -d \
   --name "$JENKINS_NAME" \
@@ -299,9 +365,9 @@ docker run -d \
   --restart unless-stopped \
   -p ${SONAR_HTTP}:9000 \
   -e SONAR_ES_BOOTSTRAP_CHECKS_DISABLE=true \
-  -e "SONAR_JDBC_URL=jdbc:h2:mem:sonar" \
-  -e "SONAR_JDBC_USERNAME=sonar" \
-  -e "SONAR_JDBC_PASSWORD=sonar" \
+  -e "SONAR_JDBC_URL=jdbc:postgresql://${POSTGRES_NAME}:5432/${POSTGRES_DB}" \
+  -e "SONAR_JDBC_USERNAME=${POSTGRES_USER}" \
+  -e "SONAR_JDBC_PASSWORD=${POSTGRES_PASSWORD}" \
   -e "ES_JAVA_OPTS=$SONAR_ES_JAVA_OPTS" \
   -e "SONAR_JAVA_OPTS=$SONAR_JAVA_OPTS" \
   -e "SONAR_WEB_JAVAADDITIONALOPTS=-server" \
@@ -316,7 +382,12 @@ docker run -d \
 CMD
 )
 
-# Start containers
+# Start containers in order: PostgreSQL -> Jenkins + SonarQube
+log "🗄️  Starting PostgreSQL database..."
+start_or_recreate "$POSTGRES_NAME" "$POSTGRES_RUN_CMD"
+wait_for_postgres 60
+
+log "🚀 Starting application containers..."
 start_or_recreate "$JENKINS_NAME" "$JENKINS_RUN_CMD"
 start_or_recreate "$SONAR_NAME" "$SONAR_RUN_CMD"
 
@@ -325,7 +396,7 @@ wait_for_service "Jenkins" "$JENKINS_HTTP" 180
 wait_for_jenkins_password
 install_jenkins_tools_if_needed
 
-wait_for_service "SonarQube" "$SONAR_HTTP" 240
+wait_for_service "SonarQube" "$SONAR_HTTP" 300
 
 print_endpoints
 
